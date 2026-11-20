@@ -1,4 +1,4 @@
-name: Build Metro 2033 Redux (IPA-Only A16 60fps + Fix Full BC)
+name: Build Metro 2033 Redux (IPA-Only A16 60fps + Full BC Fix)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       ipa_name:
         description: "Tên file IPA đầu ra"
         required: false
-        default: "Metro2033_VH_60fps_fix_miao.ipa"
+        default: "Metro2033_VH_60fps_clean_miao.ipa"
       credit_text:
         description: "Credit hiển thị trong app"
         required: false
@@ -42,7 +42,7 @@ jobs:
           echo "DOTNET_ROOT_X64=$HOME/.dotnet-x64" >> "$GITHUB_ENV"
           echo "DOTNET_ROLL_FORWARD=Major" >> "$GITHUB_ENV"
 
-      - name: Clone nxnative, Apply Full A16 BC Fix + 60fps + RAM + Miao Credit
+      - name: Clone nxnative, Apply Complete A16 BC Fix + 60fps + RAM + Miao Credit
         env:
           CREDIT_TEXT: ${{ inputs.credit_text }}
         run: |
@@ -61,9 +61,10 @@ jobs:
           echo "Using A16 patcher: $PATCH_A16"
           python3 "$PATCH_A16" src
 
-          # 2. Vá TRIỆT ĐỂ cả 2 nhánh pkg_upload_:
-          #    - Nhánh L4012 (staging arena: stg_off + off) bị lọt trước đó
-          #    - Nhánh L4079 (fallback: nâng sang strided dùng pitch)
+          # 2. Vá TRIỆT ĐỂ toàn bộ 3 đường upload BC còn lại trong nvn_mtl.m:
+          #    (a) fallback pkg_upload_ -> strided
+          #    (b) staging arena pkg_upload_ (stg_off + off)
+          #    (c) stand_fill (replaceRegion: ghi thẳng BC thô vào RGBA8 -> thủ phạm chính!)
           python3 - <<'PY'
           import re
 
@@ -77,14 +78,14 @@ jobs:
               txt = txt.replace(old_call, new_call, 1)
               print("[OK] Upgraded fallback pkg_upload_ to strided BC decode")
 
-          # (b) Vá nhánh staging arena (stg_off + off) — thủ phạm gây vỡ texture
+          # (b) Vá nhánh staging arena (stg_off + off)
           arena_re = re.compile(
               r'^([ \t]*)up_blit_add\(stg,\s*stg_off\s*\+\s*off,\s*pitch,\s*pitch\s*\*\s*rows,\s*MTLSizeMake\(w,\s*h,\s*z\),\s*mt,\s*y,\s*l\);',
               re.M,
           )
           m = arena_re.search(txt)
           if not m:
-              raise RuntimeError("[FAIL] Không tìm thấy dòng staging arena up_blit_add(stg, stg_off + off, ...) trong nvn_mtl.m!")
+              raise RuntimeError("[FAIL] Không tìm thấy staging arena up_blit_add(stg, stg_off + off, ...)!")
           ind = m.group(1)
           arena_patch = (
               f"{ind}if (!nvn_fmt_is_bc_supported() && nvn_is_bc_format(t->d.format)) {{\n"
@@ -104,8 +105,36 @@ jobs:
               f"{ind}}}"
           )
           txt = txt[:m.start()] + arena_patch + txt[m.end():]
+          print("[OK] Patched staging arena (stg_off + off) BC decode path")
+
+          # (c) Vá stand_fill (L12231 replaceRegion:) — giải mã BC trước khi ghi vào stand-in RGBA8
+          stand_re = re.compile(
+              r'^([ \t]*)if \(into\) \[into replaceRegion:MTLRegionMake2D\(0, 0, w, hh\) mipmapLevel:k slice:y withBytes:buf bytesPerRow:pitch bytesPerImage:pitch \* rows\];',
+              re.M,
+          )
+          ms = stand_re.search(txt)
+          if not ms:
+              raise RuntimeError("[FAIL] Không tìm thấy dòng stand_fill replaceRegion trong nvn_mtl.m!")
+          sind = ms.group(1)
+          stand_patch = (
+              f"{sind}if (into) {{\n"
+              f"{sind}    if (!nvn_fmt_is_bc_supported() && nvn_is_bc_format(t->d.format)) {{\n"
+              f"{sind}        int ubpp = nvn_bc_decompressed_bpp(t->d.format);\n"
+              f"{sind}        size_t upitch = (size_t)w * ubpp;\n"
+              f"{sind}        uint8_t *ubuf = (uint8_t *)malloc(upitch * hh ? upitch * hh : 16);\n"
+              f"{sind}        if (ubuf) {{\n"
+              f"{sind}            nvn_bc_decompress_level_strided(t->d.format, w, hh, buf, pitch, ubuf, upitch);\n"
+              f"{sind}            [into replaceRegion:MTLRegionMake2D(0, 0, w, hh) mipmapLevel:k slice:y withBytes:ubuf bytesPerRow:upitch bytesPerImage:upitch * hh];\n"
+              f"{sind}            free(ubuf);\n"
+              f"{sind}        }}\n"
+              f"{sind}    }} else {{\n"
+              f"{sind}        [into replaceRegion:MTLRegionMake2D(0, 0, w, hh) mipmapLevel:k slice:y withBytes:buf bytesPerRow:pitch bytesPerImage:pitch * rows];\n"
+              f"{sind}    }}\n"
+              f"{sind}}}"
+          )
+          txt = txt[:ms.start()] + stand_patch + txt[ms.end():]
           open(nvn_m, "w", encoding="utf-8").write(txt)
-          print("[OK] Patched staging arena (stg_off + off) BC decode path in nvn_mtl.m")
+          print("[OK] Patched stand_fill replaceRegion BC decode path")
           PY
 
           # 3. Đảm bảo nvn_bcdec.c được đăng ký trong file build
@@ -127,7 +156,7 @@ jobs:
                       print(f"[OK] Registered nvn_bcdec.c in {path}")
           PY
 
-          # 4. Patch Metro 2033 Redux game.tsv: Gọn 30/60 FPS (bỏ 90/120fps & tex_flush_upload thừa) + depth_mode zero
+          # 4. Patch Metro 2033 Redux game.tsv: Gọn 30/60 FPS + depth_mode zero
           python3 - <<'PY'
           import os
           tsv = "src/dm/games/0100D4900E82C000/game.tsv"
@@ -304,10 +333,10 @@ jobs:
           grep -q "fps_target" src/dm/games/0100D4900E82C000/game.tsv
           grep -q "depth_mode" src/dm/games/0100D4900E82C000/game.tsv
 
-          # Xác minh CẢ 2 nhánh pkg_upload_ (arena L4012 + fallback L4079) đều đã vá strided BC decode
+          # Xác minh ĐỦ CẢ 3 đường CPU upload BC (arena L4012 + fallback L4079 + stand_fill L12231)
           BC_STRIDED_COUNT="$(grep -c 'nvn_bc_decompress_level_strided(t->d.format' src/dm/gfx/nvn/nvn_mtl.m)"
-          echo "pkg_upload_ strided BC decode paths: $BC_STRIDED_COUNT"
-          test "$BC_STRIDED_COUNT" -ge 2
+          echo "Total strided BC decode paths in nvn_mtl.m: $BC_STRIDED_COUNT"
+          test "$BC_STRIDED_COUNT" -ge 3
 
           plutil -lint entitlements.plist
           test -f "src/dm/gfx/tex/nvn_bcdec.h"
@@ -459,13 +488,13 @@ jobs:
           SERVER="$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')"
           RESP="$(curl -s -F "file=@out_ipa/$IPA_NAME" "https://${SERVER}.gofile.io/contents/uploadfile")"
           LINK="$(echo "$RESP" | jq -r '.data.downloadPage')"
-          echo "## Download IPA (Metro 2033 Redux A16 60fps Fix Full BC + VH)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Download IPA (Metro 2033 Redux A16 60fps Clean BC + VH)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **$IPA_NAME**: $LINK" >> "$GITHUB_STEP_SUMMARY"
           echo "Uploaded $IPA_NAME -> $LINK"
 
       - name: Backup IPA as GitHub Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Metro2033-A16-VH-60fps-FixBC-IPA
+          name: Metro2033-A16-VH-60fps-CleanBC-IPA
           path: out_ipa/*.ipa
           retention-days: 7
