@@ -1,1 +1,460 @@
+name: Build Metro 2033 Redux (IPA-Only A16 60-90fps + RAM + Fix BC)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_name:
+        description: "Tên file IPA đầu ra"
+        required: false
+        default: "Metro2033_VH_90fps_miao.ipa"
+      credit_text:
+        description: "Credit hiển thị trong app"
+        required: false
+        default: "Port by Miaomiaocutene"
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Homebrew dependencies & Metal Toolchain
+        run: |
+          set -euo pipefail
+          brew install xcodegen zstd spirv-cross glslang jq p7zip
+          xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Setup .NET 10 SDK (arm64)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Setup .NET 10 Runtime (x64 for Rosetta tools)
+        run: |
+          set -euo pipefail
+          curl -sSL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
+          chmod +x dotnet-install.sh
+          ./dotnet-install.sh --channel 10.0 --runtime dotnet --architecture x64 --install-dir "$HOME/.dotnet-x64"
+          echo "DOTNET_ROOT_ARM64=$DOTNET_ROOT" >> "$GITHUB_ENV"
+          echo "DOTNET_ROOT_X64=$HOME/.dotnet-x64" >> "$GITHUB_ENV"
+          echo "DOTNET_ROLL_FORWARD=Major" >> "$GITHUB_ENV"
+
+      - name: Clone nxnative, Apply A16 Fix + 60/90fps + RAM + Miao Credit
+        env:
+          CREDIT_TEXT: ${{ inputs.credit_text }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/seedds/nxnative.git src
+          git clone --depth 1 https://github.com/Jeb0978/fifa22-nxnative.git tmp_a16
+          cp -v tmp_a16/dm/gfx/tex/*bcdec* src/dm/gfx/tex/
+          rm -rf tmp_a16
+
+          # 1. Tự tìm và chạy patch_a16.py (ở root, scripts/ hoặc .github/scripts/)
+          PATCH_A16="$(find . -maxdepth 3 -name "patch_a16.py" -not -path "./src/*" | head -n 1)"
+          if [ -z "$PATCH_A16" ]; then
+            echo "::error::Không tìm thấy patch_a16.py trong repo!"
+            exit 1
+          fi
+          echo "Using A16 patcher: $PATCH_A16"
+          python3 "$PATCH_A16" src
+
+          # 2. Tự động vá lỗi thiếu pitch trong pkg_upload_ (nvn_bc_decompress_level -> strided) + audit
+          python3 - <<'PY'
+          import os
+          nvn_m = "src/dm/gfx/nvn/nvn_mtl.m"
+          txt = open(nvn_m, encoding="utf-8").read()
+          old_call = "nvn_bc_decompress_level(t->d.format, w, h, src_slice, dst_slice, uncomp_pitch);"
+          new_call = "nvn_bc_decompress_level_strided(t->d.format, w, h, src_slice, pitch, dst_slice, uncomp_pitch);"
+          if old_call in txt:
+              txt = txt.replace(old_call, new_call, 1)
+              open(nvn_m, "w", encoding="utf-8").write(txt)
+              print("[OK] Fixed pkg_upload_ to use nvn_bc_decompress_level_strided(..., pitch, ...)")
+          elif new_call in txt:
+              print("[SKIP] pkg_upload_ already uses nvn_bc_decompress_level_strided")
+          else:
+              print("[WARN] pkg_upload_ BC call pattern not found; leaving untouched")
+
+          print("[AUDIT] Texture upload/create call sites in nvn_mtl.m:")
+          for lineno, line in enumerate(txt.splitlines(), 1):
+              if any(k in line for k in ("up_blit_add(", "replaceRegion:", "newTextureWithDescriptor:offset:")):
+                  print(f"  L{lineno}: {line.strip()[:120]}")
+          PY
+
+          # 3. Đảm bảo nvn_bcdec.c được đăng ký trong file build
+          python3 - <<'PY'
+          import os, re
+          for path in ["src/dm/ios/project.yml", "src/dm/host/Makefile", "src/dm/ios/tools/build_ipa.sh"]:
+              if not os.path.exists(path):
+                  continue
+              txt = open(path, encoding="utf-8").read()
+              if "nvn_fmt_mtl.c" in txt and "nvn_bcdec.c" not in txt:
+                  new_txt = re.sub(
+                      r'([^\s"\']*nvn_fmt_mtl\.c)',
+                      lambda m: m.group(1) + " " + m.group(1).replace("nvn_fmt_mtl.c", "nvn_bcdec.c"),
+                      txt,
+                      count=1,
+                  )
+                  if new_txt != txt:
+                      open(path, "w", encoding="utf-8").write(new_txt)
+                      print(f"[OK] Registered nvn_bcdec.c in {path}")
+          PY
+
+          # 4. Patch Metro 2033 Redux game.tsv: Unlock 60/90/120 FPS + depth_mode zero (bỏ tex_flush_upload thừa)
+          python3 - <<'PY'
+          import os
+          tsv = "src/dm/games/0100D4900E82C000/game.tsv"
+          if not os.path.exists(tsv):
+              raise RuntimeError(f"Missing {tsv}")
+          lines = open(tsv, encoding="utf-8").read().splitlines()
+          overrides = {
+              "present_interval": "display",
+              "fps_target": "60",
+              "fps_max": "120",
+              "depth_mode": "zero",
+          }
+          seen = set()
+          out = []
+          for ln in lines:
+              stripped = ln.strip()
+              if stripped and not stripped.startswith("#"):
+                  key = stripped.split()[0]
+                  if key == "tex_flush_upload":
+                      continue
+                  if key in overrides:
+                      out.append(f"{key}\t{overrides[key]}")
+                      seen.add(key)
+                      continue
+              out.append(ln)
+          for k, v in overrides.items():
+              if k not in seen:
+                  out.append(f"{k}\t{v}")
+          open(tsv, "w", encoding="utf-8").write("\n".join(out) + "\n")
+          print("[OK] Patched 0100D4900E82C000/game.tsv")
+          PY
+
+          # 5. Thêm tùy chọn 90 fps vào dm/games/settings.tsv cho Launcher
+          python3 - <<'PY'
+          import os
+          st = "src/dm/games/settings.tsv"
+          txt = open(st, encoding="utf-8").read()
+          old = "30=30 fps,60=60 fps,120=120 fps?DM_GAME_FPS_MAX==120"
+          new = "30=30 fps,60=60 fps,90=90 fps?DM_GAME_FPS_MAX==120,120=120 fps?DM_GAME_FPS_MAX==120"
+          if new not in txt:
+              if old not in txt:
+                  raise RuntimeError("DM_FPS_TARGET row not found in settings.tsv")
+              txt = txt.replace(old, new, 1)
+              open(st, "w", encoding="utf-8").write(txt)
+              print("[OK] Added 90 fps option to settings.tsv")
+          PY
+
+          # 6. Tạo entitlements.plist mở khóa Increased Memory Limit
+          cat > entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.developer.kernel.increased-memory-limit</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          # 7. Gắn Credit + Icon mèo SwiftUI vào Launcher.swift
+          python3 - <<'PY'
+          import os, re
+          launcher = "src/dm/ios/Sources/Launcher.swift"
+          if not os.path.exists(launcher):
+              raise RuntimeError(f"Missing {launcher}")
+          credit = os.environ.get("CREDIT_TEXT", "Port by Miaomiaocutene").replace('"', '\\"')
+          code = open(launcher, encoding="utf-8").read()
+          if "MiaoCreditBadge" not in code:
+              m = re.search(r'(var\s+body\s*:\s*some\s+View\s*\{)', code)
+              if not m:
+                  raise RuntimeError("Missing 'var body: some View {' in Launcher.swift")
+              hook = (
+                  "var body: some View { miaoWrapView(miaoOriginalBody) }\n"
+                  "    @ViewBuilder private var miaoOriginalBody: some View {"
+              )
+              code = code[:m.start()] + hook + code[m.end():]
+              code += f'''
+
+          private struct MiaoCatHeadShape: Shape {{
+              func path(in rect: CGRect) -> Path {{
+                  let w = rect.width
+                  let h = rect.height
+                  var p = Path()
+                  p.move(to: CGPoint(x: w * 0.16, y: h * 0.44))
+                  p.addLine(to: CGPoint(x: w * 0.22, y: h * 0.10))
+                  p.addLine(to: CGPoint(x: w * 0.40, y: h * 0.28))
+                  p.addQuadCurve(to: CGPoint(x: w * 0.60, y: h * 0.28), control: CGPoint(x: w * 0.50, y: h * 0.24))
+                  p.addLine(to: CGPoint(x: w * 0.78, y: h * 0.10))
+                  p.addLine(to: CGPoint(x: w * 0.84, y: h * 0.44))
+                  p.addCurve(
+                      to: CGPoint(x: w * 0.50, y: h * 0.90),
+                      control1: CGPoint(x: w * 0.90, y: h * 0.72),
+                      control2: CGPoint(x: w * 0.72, y: h * 0.90)
+                  )
+                  p.addCurve(
+                      to: CGPoint(x: w * 0.16, y: h * 0.44),
+                      control1: CGPoint(x: w * 0.28, y: h * 0.90),
+                      control2: CGPoint(x: w * 0.10, y: h * 0.72)
+                  )
+                  p.closeSubpath()
+                  return p
+              }}
+          }}
+
+          private struct MiaoCatIconView: View {{
+              var body: some View {{
+                  ZStack {{
+                      MiaoCatHeadShape()
+                          .fill(Color.pink.opacity(0.92))
+                      MiaoCatHeadShape()
+                          .stroke(Color.white.opacity(0.9), lineWidth: 1.2)
+                      HStack(spacing: 4) {{
+                          Circle().fill(Color.black).frame(width: 2.6, height: 2.6)
+                          Circle().fill(Color.black).frame(width: 2.6, height: 2.6)
+                      }}
+                      .offset(y: 0.5)
+                      Circle()
+                          .fill(Color.white)
+                          .frame(width: 2.2, height: 2.2)
+                          .offset(y: 3.5)
+                  }}
+                  .frame(width: 18, height: 18)
+              }}
+          }}
+
+          private struct MiaoCreditBadge: View {{
+              var body: some View {{
+                  HStack(spacing: 6) {{
+                      MiaoCatIconView()
+                      Text("{credit}")
+                          .font(.caption2.weight(.semibold))
+                          .foregroundColor(.white)
+                  }}
+                  .padding(.horizontal, 10)
+                  .padding(.vertical, 5)
+                  .background(Color.black.opacity(0.55))
+                  .clipShape(Capsule())
+                  .overlay(Capsule().stroke(Color.pink.opacity(0.65), lineWidth: 1))
+                  .allowsHitTesting(false)
+              }}
+          }}
+
+          private func miaoWrapView<V: View>(_ content: V) -> some View {{
+              ZStack(alignment: .bottomTrailing) {{
+                  content
+                  MiaoCreditBadge()
+                      .padding(.trailing, 12)
+                      .padding(.bottom, 10)
+              }}
+          }}
+          '''
+              open(launcher, "w", encoding="utf-8").write(code)
+              print("[OK] Injected MiaoCatIconView + credit into Launcher.swift")
+          PY
+
+          # 8. Cấp quyền thực thi cho binary & script
+          chmod +x src/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate 2>/dev/null || true
+          chmod +x src/dm/gfx/tools/spirv_cross_bin/spirv-cross 2>/dev/null || true
+          chmod +x src/dm/tools/nx_extract_bin/nx_extract 2>/dev/null || true
+          find src -type f -name "*.sh" -exec chmod +x {} +
+
+      - name: Setup Python venv
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          if [ -f src/.github/requirements/tools.txt ]; then
+            pip install -r src/.github/requirements/tools.txt
+          fi
+          pip install gdown requests lz4 "capstone>=5,<6" fonttools nsz zbic pycryptodome zstandard pillow "backports.zstd; python_version < '3.14'"
+
+      - name: Fail-Fast Pre-Flight Check (trước khi tải game)
+        env:
+          GAME_URL: ${{ secrets.GAME_URL }}
+          KEYS_URL: ${{ secrets.KEYS_URL }}
+          VH_URL: ${{ secrets.VH_URL }}
+          CREDIT_TEXT: ${{ inputs.credit_text }}
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+
+          test -n "$GAME_URL"
+          test -n "$KEYS_URL"
+          test -n "$VH_URL"
+
+          test -d "src/dm/games/0100D4900E82C000"
+          grep -q "present_interval" src/dm/games/0100D4900E82C000/game.tsv
+          grep -q "fps_target" src/dm/games/0100D4900E82C000/game.tsv
+          grep -q "fps_max" src/dm/games/0100D4900E82C000/game.tsv
+          grep -q "depth_mode" src/dm/games/0100D4900E82C000/game.tsv
+          grep -q "90=90 fps" src/dm/games/settings.tsv
+          grep -q "nvn_bc_decompress_level_strided(t->d.format" src/dm/gfx/nvn/nvn_mtl.m
+
+          plutil -lint entitlements.plist
+          test -f "src/dm/gfx/tex/nvn_bcdec.h"
+          test -f "src/dm/gfx/tex/nvn_bcdec.c"
+          test -f "src/dm/tools/romfs_image.py"
+          grep -q "$CREDIT_TEXT" src/dm/ios/Sources/Launcher.swift
+          grep -q "MiaoCatIconView" src/dm/ios/Sources/Launcher.swift
+
+          if [ -x src/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate ]; then
+            ./src/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate --source-sha
+          fi
+          command -v spirv-cross
+          python3 -c "import lz4, capstone, fontTools, zbic, Crypto, Crypto.Cipher.AES, zstandard, PIL; print('[OK] Python ready')"
+          echo "[OK] Pre-Flight passed!"
+
+      - name: Download Game, Keys, and Vietnamese Patch
+        env:
+          GAME_URL: ${{ secrets.GAME_URL }}
+          KEYS_URL: ${{ secrets.KEYS_URL }}
+          VH_URL: ${{ secrets.VH_URL }}
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          mkdir -p game_files keys_dir vh_raw vh_romfs out_ipa
+
+          curl -sSL https://raw.githubusercontent.com/ltsdw/gofile-downloader/main/gofile-downloader.py -o gofile-downloader.py
+
+          download_any() {
+            local url="$1"
+            local out_dir="$2"
+            if [[ "$url" == *"gofile.io"* ]]; then
+              GF_DOWNLOAD_DIR="$out_dir" python3 gofile-downloader.py "$url"
+            elif [[ "$url" == *"drive.google.com"* ]]; then
+              if [[ "$url" == *"/folders/"* ]]; then
+                (cd "$out_dir" && gdown --folder "$url")
+              else
+                local fid
+                fid="$(echo "$url" | sed -nE 's/.*\/d\/([^\/?]+).*/\1/p; s/.*[?&]id=([^&]+).*/\1/p' | head -n 1)"
+                if [ -n "$fid" ]; then
+                  (cd "$out_dir" && gdown "https://drive.google.com/uc?id=${fid}")
+                else
+                  (cd "$out_dir" && gdown "$url")
+                fi
+              fi
+            else
+              (cd "$out_dir" && curl -fSL -O -J "$url")
+            fi
+            find "$out_dir" -mindepth 2 -type f -exec mv -f {} "$out_dir"/ \;
+            find "$out_dir" -mindepth 1 -type d -empty -delete
+          }
+
+          echo "=== Downloading KEYS_URL ==="
+          download_any "$KEYS_URL" "keys_dir"
+          ls -lh keys_dir
+
+          echo "=== Downloading VH_URL ==="
+          download_any "$VH_URL" "vh_raw"
+          for arc in vh_raw/*.zip vh_raw/*.rar vh_raw/*.7z; do
+            if [ -f "$arc" ]; then
+              7z x -y "$arc" -ovh_raw/unpacked
+            fi
+          done
+          find vh_raw -type f \( -iname "*.vfs" -o -iname "*.vfs0" -o -iname "*.vfx" \) -exec cp -fv {} vh_romfs/ \;
+          ls -lh vh_romfs
+          if [ -z "$(ls -A vh_romfs)" ]; then
+            echo "::error::Không tìm thấy file .vfs / .vfs0 / .vfx trong VH_URL!"
+            exit 1
+          fi
+
+          echo "=== Downloading GAME_URL ==="
+          download_any "$GAME_URL" "game_files"
+          ls -lh game_files
+
+      - name: Build IPA-Only (Synced romfs.id with VH, No RomFS Upload)
+        env:
+          IPA_NAME: ${{ inputs.ipa_name }}
+          CREDIT_TEXT: ${{ inputs.credit_text }}
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          ROOT="$PWD"
+
+          PROD_KEYS="$(find "$ROOT/keys_dir" -type f -iname "*prod.keys*" | head -n 1)"
+          if [ -z "$PROD_KEYS" ]; then
+            PROD_KEYS="$(find "$ROOT/keys_dir" -type f -iname "*.keys" | head -n 1)"
+          fi
+          test -n "$PROD_KEYS"
+
+          # Pass 1: Extract + dịch 854 shaders + build lần 1
+          (
+            cd "$ROOT/src"
+            DM_ENTITLEMENTS="$ROOT/entitlements.plist" \
+            python3 scripts/build_ipa_from_nsp.py "$ROOT/game_files" \
+              -k "$PROD_KEYS" \
+              --allow-other-metal \
+              --romfs separate \
+              -o "$ROOT/out_ipa/$IPA_NAME"
+          )
+
+          # Đồng bộ romfs.id với bản Việt hóa (dùng lại đúng romfs.img 6.3 GB đã tải)
+          ROMFS_IMG_TARGET="$(find "$ROOT/game_files" "$ROOT/src" -maxdepth 6 -type f -iname "RomFS.img" | head -n 1)"
+          test -n "$ROMFS_IMG_TARGET"
+
+          BASE_NSP="$(find "$ROOT/game_files" -type f \( -iname "*.nsp" -o -iname "*.xci" \) | head -n 1)"
+          test -n "$BASE_NSP"
+
+          mkdir -p "$ROOT/vh_stage"
+          "$ROOT/src/dm/tools/nx_extract_bin/nx_extract" "$PROD_KEYS" "$BASE_NSP" - "$ROOT/vh_stage"
+          test -d "$ROOT/vh_stage/RomFS"
+
+          cp -fv "$ROOT/vh_romfs/"* "$ROOT/vh_stage/RomFS/"
+          python3 "$ROOT/src/dm/tools/romfs_image.py" "$ROOT/vh_stage/RomFS" "$ROMFS_IMG_TARGET"
+          rm -rf "$ROOT/vh_stage"
+
+          # Pass 2: Build lại mỗi .ipa với romfs.id khớp romfs.img Việt hóa
+          rm -f "$ROOT/out_ipa/$IPA_NAME"
+          (
+            cd "$ROOT/src"
+            DM_ENTITLEMENTS="$ROOT/entitlements.plist" \
+            python3 scripts/build_ipa_from_nsp.py "$ROOT/game_files" \
+              -k "$PROD_KEYS" \
+              --allow-other-metal \
+              --romfs separate \
+              -o "$ROOT/out_ipa/$IPA_NAME"
+          )
+
+          # Xóa RomFS.img tạm để CHỈ giữ lại file .ipa
+          rm -f "$ROMFS_IMG_TARGET" "$ROOT/out_ipa/"*romfs*.img "$ROOT/out_ipa/"*RomFS*.img || true
+
+          # Gắn credit vào Info.plist trong IPA
+          mkdir -p "$ROOT/tmp_ipa"
+          unzip -q "$ROOT/out_ipa/$IPA_NAME" -d "$ROOT/tmp_ipa"
+          PLIST="$(find "$ROOT/tmp_ipa/Payload" -maxdepth 2 -name "Info.plist" | head -n 1)"
+          test -n "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright $CREDIT_TEXT" "$PLIST" 2>/dev/null || \
+          /usr/libexec/PlistBuddy -c "Add :NSHumanReadableCopyright string $CREDIT_TEXT" "$PLIST"
+          rm -f "$ROOT/out_ipa/$IPA_NAME"
+          (cd "$ROOT/tmp_ipa" && zip -qry "$ROOT/out_ipa/$IPA_NAME" Payload)
+          rm -rf "$ROOT/tmp_ipa"
+
+          ls -lh "$ROOT/out_ipa"
+
+      - name: Upload IPA-Only to Gofile
+        env:
+          IPA_NAME: ${{ inputs.ipa_name }}
+        run: |
+          set -euo pipefail
+          test -f "out_ipa/$IPA_NAME"
+          SERVER="$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')"
+          RESP="$(curl -s -F "file=@out_ipa/$IPA_NAME" "https://${SERVER}.gofile.io/contents/uploadfile")"
+          LINK="$(echo "$RESP" | jq -r '.data.downloadPage')"
+          echo "## Download IPA (Metro 2033 Redux A16 60/90fps + VH)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **$IPA_NAME**: $LINK" >> "$GITHUB_STEP_SUMMARY"
+          echo "Uploaded $IPA_NAME -> $LINK"
+
+      - name: Backup IPA as GitHub Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Metro2033-A16-VH-90fps-IPA
+          path: out_ipa/*.ipa
+          retention-days: 7
 
