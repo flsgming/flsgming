@@ -140,7 +140,7 @@ def main():
         '                for (uint32_t zi = 0; zi < z; zi++) {\n'
         '                    const uint8_t *src_slice = (const uint8_t *)stg.contents + off + zi * (pitch * rows);\n'
         '                    uint8_t *dst_slice = (uint8_t *)uncomp_stg.contents + uncomp_off + zi * uncomp_img;\n'
-        '                    nvn_bc_decompress_level(t->d.format, w, h, src_slice, dst_slice, uncomp_pitch);\n'
+        '                    nvn_bc_decompress_level_strided(t->d.format, w, h, src_slice, pitch, dst_slice, uncomp_pitch);\n'
         '                }\n'
         '                up_blit_add(uncomp_stg, uncomp_off, uncomp_pitch, uncomp_img, MTLSizeMake(w, h, z), mt, y, l);\n'
         '                uncomp_off += uncomp_img * z;\n'
@@ -148,7 +148,7 @@ def main():
         '                up_blit_add(stg, off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l);\n'
         '            }\n'
         '            off += pitch * rows * z;',
-        "nvn_mtl.m: pkg_upload_ decompress loop"
+        "nvn_mtl.m: pkg_upload_ strided decompress loop"
     )
 
     with open(nvn_m, "r", encoding="utf-8") as f:
@@ -243,6 +243,12 @@ def main():
         with open(nvn_m, "w", encoding="utf-8") as f:
             f.write(nvn_txt)
         print("[OK] nvn_mtl.m: copy_b2t software BC path")
+
+    # 5. Audit chi-doc: in ra cac duong upload texture khac (neu co) de de soi log
+    print("[AUDIT] Texture upload/create call sites in nvn_mtl.m:")
+    for lineno, line in enumerate(nvn_txt.splitlines(), 1):
+        if any(k in line for k in ("up_blit_add(", "replaceRegion:", "newTextureWithDescriptor:offset:")):
+            print(f"  L{lineno}: {line.strip()[:120]}")
 
 if __name__ == "__main__":
     main()
