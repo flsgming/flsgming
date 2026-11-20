@@ -1,0 +1,44 @@
+name: Inspect A16 BC Paths (Free Linux)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect BC & Texture Paths
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/seedds/nxnative.git src
+          git clone --depth 1 https://github.com/Jeb0978/fifa22-nxnative.git a16
+          git clone --depth 1 https://github.com/zenvyzenshiro/NXNativeWindows.git nxw
+
+          python3 - <<'PY'
+          def show_lines(path, start, end, title):
+              print(f"\n=== {title} ({path}:{start}-{end}) ===")
+              lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+              for i in range(max(1, start), min(len(lines), end) + 1):
+                  print(f"L{i}: {lines[i-1]}")
+
+          # 1. Toàn bộ nvn_fmt_mtl.c của upstream và phần format trong nvn_bcdec.c
+          show_lines("src/dm/gfx/tex/nvn_fmt_mtl.c", 1, 140, "UPSTREAM nvn_fmt_mtl.c")
+          show_lines("a16/dm/gfx/tex/nvn_bcdec.c", 1, 120, "A16 nvn_bcdec.c (format mapping)")
+
+          # 2. Ngữ cảnh quanh replaceRegion (L12251) và copy_t2t trong upstream nvn_mtl.m
+          nvn_lines = open("src/dm/gfx/nvn/nvn_mtl.m", encoding="utf-8", errors="replace").read().splitlines()
+          for idx, ln in enumerate(nvn_lines, 1):
+              if "replaceRegion:" in ln and idx > 11980:
+                  show_lines("src/dm/gfx/nvn/nvn_mtl.m", idx - 25, idx + 10, f"UPSTREAM replaceRegion @ L{idx}")
+              if ln.startswith("static void copy_t2t("):
+                  show_lines("src/dm/gfx/nvn/nvn_mtl.m", idx, idx + 45, f"UPSTREAM copy_t2t @ L{idx}")
+
+          # 3. Mọi điểm hook BC của NXNativeWindows (A16 đã chạy chuẩn)
+          print("\n=== NXNativeWindows BC hooks in nvn_mtl.m & nvn_fmt_mtl.c ===")
+          for p in ["nxw/dm/gfx/tex/nvn_fmt_mtl.c", "nxw/dm/gfx/nvn/nvn_mtl.m"]:
+              lines = open(p, encoding="utf-8", errors="replace").read().splitlines()
+              print(f"--- {p} ---")
+              for i, ln in enumerate(lines, 1):
+                  if any(k in ln for k in ("bc_soft", "BC_ASTC", "is_bc", "bc_to_", "bc_transcode", "bc_decode", "supportsBCTextureCompression")):
+                      print(f"  L{i}: {ln.strip()[:120]}")
+          PY
