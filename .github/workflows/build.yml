@@ -1,4 +1,4 @@
-name: Build Metro 2033 Redux (IPA-Only A16 60-90fps + RAM + Fix BC)
+name: Build Metro 2033 Redux (IPA-Only A16 60fps + Fix Full BC)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       ipa_name:
         description: "Tên file IPA đầu ra"
         required: false
-        default: "Metro2033_VH_90fps_miao.ipa"
+        default: "Metro2033_VH_60fps_fix_miao.ipa"
       credit_text:
         description: "Credit hiển thị trong app"
         required: false
@@ -42,7 +42,7 @@ jobs:
           echo "DOTNET_ROOT_X64=$HOME/.dotnet-x64" >> "$GITHUB_ENV"
           echo "DOTNET_ROLL_FORWARD=Major" >> "$GITHUB_ENV"
 
-      - name: Clone nxnative, Apply A16 Fix + 60/90fps + RAM + Miao Credit
+      - name: Clone nxnative, Apply Full A16 BC Fix + 60fps + RAM + Miao Credit
         env:
           CREDIT_TEXT: ${{ inputs.credit_text }}
         run: |
@@ -52,7 +52,7 @@ jobs:
           cp -v tmp_a16/dm/gfx/tex/*bcdec* src/dm/gfx/tex/
           rm -rf tmp_a16
 
-          # 1. Tự tìm và chạy patch_a16.py (ở root, scripts/ hoặc .github/scripts/)
+          # 1. Tự tìm và chạy patch_a16.py
           PATCH_A16="$(find . -maxdepth 3 -name "patch_a16.py" -not -path "./src/*" | head -n 1)"
           if [ -z "$PATCH_A16" ]; then
             echo "::error::Không tìm thấy patch_a16.py trong repo!"
@@ -61,26 +61,51 @@ jobs:
           echo "Using A16 patcher: $PATCH_A16"
           python3 "$PATCH_A16" src
 
-          # 2. Tự động vá lỗi thiếu pitch trong pkg_upload_ (nvn_bc_decompress_level -> strided) + audit
+          # 2. Vá TRIỆT ĐỂ cả 2 nhánh pkg_upload_:
+          #    - Nhánh L4012 (staging arena: stg_off + off) bị lọt trước đó
+          #    - Nhánh L4079 (fallback: nâng sang strided dùng pitch)
           python3 - <<'PY'
-          import os
+          import re
+
           nvn_m = "src/dm/gfx/nvn/nvn_mtl.m"
           txt = open(nvn_m, encoding="utf-8").read()
+
+          # (a) Nâng nhánh fallback sang strided nếu patch_a16.py còn dùng bản cũ
           old_call = "nvn_bc_decompress_level(t->d.format, w, h, src_slice, dst_slice, uncomp_pitch);"
           new_call = "nvn_bc_decompress_level_strided(t->d.format, w, h, src_slice, pitch, dst_slice, uncomp_pitch);"
           if old_call in txt:
               txt = txt.replace(old_call, new_call, 1)
-              open(nvn_m, "w", encoding="utf-8").write(txt)
-              print("[OK] Fixed pkg_upload_ to use nvn_bc_decompress_level_strided(..., pitch, ...)")
-          elif new_call in txt:
-              print("[SKIP] pkg_upload_ already uses nvn_bc_decompress_level_strided")
-          else:
-              print("[WARN] pkg_upload_ BC call pattern not found; leaving untouched")
+              print("[OK] Upgraded fallback pkg_upload_ to strided BC decode")
 
-          print("[AUDIT] Texture upload/create call sites in nvn_mtl.m:")
-          for lineno, line in enumerate(txt.splitlines(), 1):
-              if any(k in line for k in ("up_blit_add(", "replaceRegion:", "newTextureWithDescriptor:offset:")):
-                  print(f"  L{lineno}: {line.strip()[:120]}")
+          # (b) Vá nhánh staging arena (stg_off + off) — thủ phạm gây vỡ texture
+          arena_re = re.compile(
+              r'^([ \t]*)up_blit_add\(stg,\s*stg_off\s*\+\s*off,\s*pitch,\s*pitch\s*\*\s*rows,\s*MTLSizeMake\(w,\s*h,\s*z\),\s*mt,\s*y,\s*l\);',
+              re.M,
+          )
+          m = arena_re.search(txt)
+          if not m:
+              raise RuntimeError("[FAIL] Không tìm thấy dòng staging arena up_blit_add(stg, stg_off + off, ...) trong nvn_mtl.m!")
+          ind = m.group(1)
+          arena_patch = (
+              f"{ind}if (!nvn_fmt_is_bc_supported() && nvn_is_bc_format(t->d.format)) {{\n"
+              f"{ind}    int ubpp = nvn_bc_decompressed_bpp(t->d.format);\n"
+              f"{ind}    size_t upitch = (size_t)w * ubpp;\n"
+              f"{ind}    size_t uimg = upitch * h;\n"
+              f"{ind}    id<MTLBuffer> ub = [g_dev newBufferWithLength:(uimg * z ? uimg * z : 16) options:MTLResourceStorageModeShared];\n"
+              f"{ind}    res_add(ub); [g_up_keep addObject:ub];\n"
+              f"{ind}    for (uint32_t zi = 0; zi < z; zi++) {{\n"
+              f"{ind}        const uint8_t *src_slice = (const uint8_t *)stg.contents + stg_off + off + zi * (pitch * rows);\n"
+              f"{ind}        uint8_t *dst_slice = (uint8_t *)ub.contents + zi * uimg;\n"
+              f"{ind}        nvn_bc_decompress_level_strided(t->d.format, w, h, src_slice, pitch, dst_slice, upitch);\n"
+              f"{ind}    }}\n"
+              f"{ind}    up_blit_add(ub, 0, upitch, uimg, MTLSizeMake(w, h, z), mt, y, l);\n"
+              f"{ind}}} else {{\n"
+              f"{ind}    up_blit_add(stg, stg_off + off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l);\n"
+              f"{ind}}}"
+          )
+          txt = txt[:m.start()] + arena_patch + txt[m.end():]
+          open(nvn_m, "w", encoding="utf-8").write(txt)
+          print("[OK] Patched staging arena (stg_off + off) BC decode path in nvn_mtl.m")
           PY
 
           # 3. Đảm bảo nvn_bcdec.c được đăng ký trong file build
@@ -102,7 +127,7 @@ jobs:
                       print(f"[OK] Registered nvn_bcdec.c in {path}")
           PY
 
-          # 4. Patch Metro 2033 Redux game.tsv: Unlock 60/90/120 FPS + depth_mode zero (bỏ tex_flush_upload thừa)
+          # 4. Patch Metro 2033 Redux game.tsv: Gọn 30/60 FPS (bỏ 90/120fps & tex_flush_upload thừa) + depth_mode zero
           python3 - <<'PY'
           import os
           tsv = "src/dm/games/0100D4900E82C000/game.tsv"
@@ -112,16 +137,16 @@ jobs:
           overrides = {
               "present_interval": "display",
               "fps_target": "60",
-              "fps_max": "120",
               "depth_mode": "zero",
           }
+          drop_keys = {"fps_max", "tex_flush_upload"}
           seen = set()
           out = []
           for ln in lines:
               stripped = ln.strip()
               if stripped and not stripped.startswith("#"):
                   key = stripped.split()[0]
-                  if key == "tex_flush_upload":
+                  if key in drop_keys:
                       continue
                   if key in overrides:
                       out.append(f"{key}\t{overrides[key]}")
@@ -132,25 +157,10 @@ jobs:
               if k not in seen:
                   out.append(f"{k}\t{v}")
           open(tsv, "w", encoding="utf-8").write("\n".join(out) + "\n")
-          print("[OK] Patched 0100D4900E82C000/game.tsv")
+          print("[OK] Patched 0100D4900E82C000/game.tsv (30/60fps + depth_mode zero)")
           PY
 
-          # 5. Thêm tùy chọn 90 fps vào dm/games/settings.tsv cho Launcher
-          python3 - <<'PY'
-          import os
-          st = "src/dm/games/settings.tsv"
-          txt = open(st, encoding="utf-8").read()
-          old = "30=30 fps,60=60 fps,120=120 fps?DM_GAME_FPS_MAX==120"
-          new = "30=30 fps,60=60 fps,90=90 fps?DM_GAME_FPS_MAX==120,120=120 fps?DM_GAME_FPS_MAX==120"
-          if new not in txt:
-              if old not in txt:
-                  raise RuntimeError("DM_FPS_TARGET row not found in settings.tsv")
-              txt = txt.replace(old, new, 1)
-              open(st, "w", encoding="utf-8").write(txt)
-              print("[OK] Added 90 fps option to settings.tsv")
-          PY
-
-          # 6. Tạo entitlements.plist mở khóa Increased Memory Limit
+          # 5. Tạo entitlements.plist mở khóa Increased Memory Limit
           cat > entitlements.plist <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -162,7 +172,7 @@ jobs:
           </plist>
           EOF
 
-          # 7. Gắn Credit + Icon mèo SwiftUI vào Launcher.swift
+          # 6. Gắn Credit + Icon mèo SwiftUI vào Launcher.swift
           python3 - <<'PY'
           import os, re
           launcher = "src/dm/ios/Sources/Launcher.swift"
@@ -258,7 +268,7 @@ jobs:
               print("[OK] Injected MiaoCatIconView + credit into Launcher.swift")
           PY
 
-          # 8. Cấp quyền thực thi cho binary & script
+          # 7. Cấp quyền thực thi cho binary & script
           chmod +x src/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate 2>/dev/null || true
           chmod +x src/dm/gfx/tools/spirv_cross_bin/spirv-cross 2>/dev/null || true
           chmod +x src/dm/tools/nx_extract_bin/nx_extract 2>/dev/null || true
@@ -292,10 +302,12 @@ jobs:
           test -d "src/dm/games/0100D4900E82C000"
           grep -q "present_interval" src/dm/games/0100D4900E82C000/game.tsv
           grep -q "fps_target" src/dm/games/0100D4900E82C000/game.tsv
-          grep -q "fps_max" src/dm/games/0100D4900E82C000/game.tsv
           grep -q "depth_mode" src/dm/games/0100D4900E82C000/game.tsv
-          grep -q "90=90 fps" src/dm/games/settings.tsv
-          grep -q "nvn_bc_decompress_level_strided(t->d.format" src/dm/gfx/nvn/nvn_mtl.m
+
+          # Xác minh CẢ 2 nhánh pkg_upload_ (arena L4012 + fallback L4079) đều đã vá strided BC decode
+          BC_STRIDED_COUNT="$(grep -c 'nvn_bc_decompress_level_strided(t->d.format' src/dm/gfx/nvn/nvn_mtl.m)"
+          echo "pkg_upload_ strided BC decode paths: $BC_STRIDED_COUNT"
+          test "$BC_STRIDED_COUNT" -ge 2
 
           plutil -lint entitlements.plist
           test -f "src/dm/gfx/tex/nvn_bcdec.h"
@@ -447,14 +459,13 @@ jobs:
           SERVER="$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')"
           RESP="$(curl -s -F "file=@out_ipa/$IPA_NAME" "https://${SERVER}.gofile.io/contents/uploadfile")"
           LINK="$(echo "$RESP" | jq -r '.data.downloadPage')"
-          echo "## Download IPA (Metro 2033 Redux A16 60/90fps + VH)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Download IPA (Metro 2033 Redux A16 60fps Fix Full BC + VH)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **$IPA_NAME**: $LINK" >> "$GITHUB_STEP_SUMMARY"
           echo "Uploaded $IPA_NAME -> $LINK"
 
       - name: Backup IPA as GitHub Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Metro2033-A16-VH-90fps-IPA
+          name: Metro2033-A16-VH-60fps-FixBC-IPA
           path: out_ipa/*.ipa
           retention-days: 7
-
